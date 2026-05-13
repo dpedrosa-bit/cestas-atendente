@@ -10,17 +10,18 @@ REGRA DE OURO: Tools NUNCA podem inventar dados. Sempre consultam fonte real
 O agente usa esse erro para responder honestamente ("não encontrei seu pedido,
 posso transferir para um atendente humano?").
 
-Estado do MVP (Fase 1): apenas leitura.
-- buscar_pedido_por_telefone     [implementado]
-- buscar_pedido_por_numero       [implementado]
-- escalar_para_humano            [implementado — apenas marca a sessão]
+Estado (Fase 1 + Sprint 2): apenas leitura.
+- buscar_pedido_por_telefone           [implementado — Shopify Admin REST]
+- buscar_pedido_por_numero             [implementado — Shopify Admin REST]
+- verificar_disponibilidade_entrega    [implementado — via cestas-company/api/atendente/slots]
+- escalar_para_humano                  [implementado — apenas marca a sessão]
 
 Próximas fases:
 - status_producao(order_id)        -> via cestas-routes
 - status_entrega(order_id)         -> via cestas-routes (rota, motorista, ETA)
-- slots_disponiveis(data, cep)     -> via cestas-company
 """
 import shopify_client
+import cestas_company_client
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -67,6 +68,43 @@ TOOL_DEFINITIONS = [
                 },
             },
             'required': ['order_number'],
+        },
+    },
+    {
+        'name': 'verificar_disponibilidade_entrega',
+        'description': (
+            'Consulta a disponibilidade real de slots de entrega para um CEP — '
+            'mesma logica que o widget no site usa, em tempo real. USE quando '
+            'o cliente perguntar coisas como "consegue entregar hoje?", '
+            '"qual o prazo pra meu CEP?", "posso receber amanha?", "tem entrega '
+            'pra sabado?", ou quando ele perguntar sobre fazer um novo pedido. '
+            'Retorna informacoes do endereco (bairro, cidade), distancia da '
+            'loja, e para cada dia (hoje + dias_a_consultar futuros) as janelas '
+            'disponiveis com preco de frete. Cada slot tem campo "available" '
+            '(true/false) — se false, "reason" explica por que (ex: "cutoff '
+            'passado"). Se o CEP estiver fora da area, retorna available=false '
+            'no nivel do CEP. Sempre peca o CEP ao cliente antes de chamar a '
+            'tool (formato 8 digitos, com ou sem traco — a tool normaliza).'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'cep': {
+                    'type': 'string',
+                    'description': 'CEP em qualquer formato (ex: "01310100", "01310-100", "01310 100").',
+                },
+                'dias_a_consultar': {
+                    'type': 'integer',
+                    'description': (
+                        'Quantos dias alem de hoje consultar (0 a 14). '
+                        'Default 3 — cobre hoje + 3 dias futuros, suficiente '
+                        'pra perguntas tipo "tem entrega ate sexta?". '
+                        'Use 0 para apenas hoje. Use 7 quando o cliente quer '
+                        'planejar a semana toda.'
+                    ),
+                },
+            },
+            'required': ['cep'],
         },
     },
     {
@@ -173,6 +211,84 @@ def _tool_buscar_pedido_por_numero(input_data, context):
     return {'order': shopify_client.summarize_order(o)}
 
 
+def _tool_verificar_disponibilidade_entrega(input_data, context):
+    """Consulta /api/atendente/slots do cestas-company. Reaproveita a logica
+    EXATA do widget (port FIEL em Python — ver cestasapp/app.py).
+
+    Retorno otimizado pra Claude:
+    - Mantem estrutura por dia (Claude entende melhor que slot flat)
+    - Inclui current_time_brt pra Claude formular respostas tipo "ainda da
+      ate as 13h" se necessario
+    - Remove campos verbose que so importam pro widget (variant_id, cutoff_*)
+    """
+    if not cestas_company_client.is_configured():
+        return {
+            'error': 'integracao_indisponivel',
+            'message': 'Sistema de consulta de entregas temporariamente offline. Escalar pra humano se urgente.',
+        }
+
+    cep = (input_data or {}).get('cep', '').strip()
+    if not cep:
+        return {'error': 'cep_vazio', 'message': 'CEP obrigatorio.'}
+
+    dias = (input_data or {}).get('dias_a_consultar')
+    if dias is None:
+        dias = 3
+    try:
+        dias = int(dias)
+    except (TypeError, ValueError):
+        dias = 3
+
+    resp = cestas_company_client.get_delivery_slots(cep, days_ahead=dias)
+
+    if resp.get('error'):
+        return {
+            'error': resp.get('error'),
+            'message': resp.get('message') or 'Falha ao consultar disponibilidade.',
+        }
+
+    if not resp.get('available'):
+        return {
+            'available': False,
+            'cep': resp.get('cep'),
+            'bairro': resp.get('bairro'),
+            'cidade': resp.get('cidade'),
+            'message': resp.get('message') or 'CEP fora da area de entrega.',
+        }
+
+    # Resposta enxuta: tira campos verbose que sao so do widget
+    days_clean = []
+    for day in resp.get('days') or []:
+        slots_clean = []
+        for s in day.get('slots') or []:
+            slots_clean.append({
+                'janela': s.get('label'),
+                'tipo': s.get('delivery_type_label'),
+                'preco': s.get('price_label'),
+                'disponivel': s.get('available'),
+                'motivo_indisponivel': s.get('reason'),
+            })
+        days_clean.append({
+            'data': day.get('date'),
+            'dia': day.get('day_name'),
+            'bloqueada': day.get('blocked'),
+            'slots': slots_clean,
+        })
+
+    return {
+        'available': True,
+        'cep': resp.get('cep'),
+        'logradouro': resp.get('logradouro'),
+        'bairro': resp.get('bairro'),
+        'cidade': resp.get('cidade'),
+        'estado': resp.get('estado'),
+        'distancia_km': resp.get('distance_km'),
+        'regiao': resp.get('range_label'),
+        'agora_brt': resp.get('current_time_brt'),
+        'dias': days_clean,
+    }
+
+
 def _tool_escalar_para_humano(input_data, context):
     """Marca a sessão como handoff e cria registro em atendente_handoff.
     O envio efetivo de notificação para a equipe (e-mail/Telegram) fica para
@@ -207,6 +323,7 @@ def _tool_escalar_para_humano(input_data, context):
 TOOL_IMPL = {
     'buscar_pedido_por_telefone': _tool_buscar_pedido_por_telefone,
     'buscar_pedido_por_numero': _tool_buscar_pedido_por_numero,
+    'verificar_disponibilidade_entrega': _tool_verificar_disponibilidade_entrega,
     'escalar_para_humano': _tool_escalar_para_humano,
 }
 
