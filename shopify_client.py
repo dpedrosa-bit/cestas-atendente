@@ -3,17 +3,23 @@ shopify_client.py - Cliente leve para a Admin API da Shopify
 
 Usa REST por simplicidade (igual ao cestas-routes). Token estático via
 SHOPIFY_TOKEN. Para a fase 2 podemos migrar para o fluxo OAuth Client
-Credentials usado no cestas-company, mas para o MVP não vale a pena a
-complexidade adicional.
+Credentials usado no cestas-company, ou pra GraphQL pra buscas mais
+flexiveis, mas para o MVP REST + multiplas variantes resolve.
 
 API version travada em 2024-10 (igual cestas-routes).
 """
 import os
+import logging
 import requests
+
+logger = logging.getLogger(__name__)
 
 SHOPIFY_DOMAIN = os.environ.get('SHOPIFY_DOMAIN', '')
 SHOPIFY_TOKEN = os.environ.get('SHOPIFY_TOKEN', '')
 SHOPIFY_API_VERSION = os.environ.get('SHOPIFY_API_VERSION', '2024-10')
+# Prefixo da numeracao da loja (ex: "CC" para Cestas Company -> pedidos #CC3752).
+# Vazio para lojas sem prefixo. Cliente pode digitar com ou sem o prefixo.
+SHOPIFY_ORDER_PREFIX = os.environ.get('SHOPIFY_ORDER_PREFIX', '').strip().upper()
 
 
 def is_configured():
@@ -46,9 +52,13 @@ def search_customers_by_phone(phone_variants, timeout=15):
     try:
         r = requests.get(url, headers=_headers(), params=params, timeout=timeout)
         if r.status_code >= 400:
+            logger.warning(f'[shopify] customer search HTTP {r.status_code} query={query!r}: {r.text[:200]}')
             return []
-        return r.json().get('customers', []) or []
-    except requests.exceptions.RequestException:
+        customers = r.json().get('customers', []) or []
+        logger.info(f'[shopify] customer search query={query!r} → {len(customers)} hit(s)')
+        return customers
+    except requests.exceptions.RequestException as e:
+        logger.warning(f'[shopify] customer search request error: {e}')
         return []
 
 
@@ -80,38 +90,107 @@ def list_customer_orders(customer_id, limit=5, timeout=15):
 
 
 def get_order_by_number(order_number, timeout=15):
-    """Busca um pedido pelo número (ex: 12345 ou #12345 ou CC12345).
-    Retorna o pedido ou None."""
+    """Busca um pedido pelo número. Aceita varios formatos como o cliente
+    pode digitar no WhatsApp:
+      - "CC3752"   -> busca name=#CC3752
+      - "Cc3752"   -> busca name=#CC3752 (case-insensitive)
+      - "#CC3752"  -> busca name=#CC3752
+      - "3752"     -> busca name=#CC3752 (prepende prefixo da env), fallback #3752
+      - "#3752"    -> idem
+    Retorna o pedido (dict) ou None se nao achar."""
     if not is_configured() or not order_number:
         return None
 
-    # Limpeza: aceita "CC12345", "#12345", "12345"
-    raw = str(order_number).strip()
-    digits_only = ''.join(ch for ch in raw if ch.isdigit())
-    if not digits_only:
+    raw = str(order_number).strip().lstrip('#').upper()
+    if not raw:
         return None
 
-    # Shopify aceita busca por `name` (ex: "#1001") ou `order_number` numérico.
+    has_letters = any(c.isalpha() for c in raw)
+
+    # Lista de nomes candidatos a tentar (ordem importa: mais especifico primeiro).
+    # Cobrimos os 3 padroes que vimos na pratica:
+    #   - "#CC3752"  (padrao Shopify default)
+    #   - "CC3752"   (lojas que customizam ordem e removem o #)
+    #   - "cc3752"   (variantes em caixa baixa — algumas lojas)
+    bare_candidates = []
+    if has_letters:
+        bare_candidates.append(raw)  # "CC3752"
+    else:
+        if SHOPIFY_ORDER_PREFIX:
+            bare_candidates.append(f'{SHOPIFY_ORDER_PREFIX}{raw}')  # "CC3752"
+        bare_candidates.append(raw)  # "3752"
+
+    # Para cada bare, gera 4 variantes de busca
+    candidates = []
+    for bare in bare_candidates:
+        candidates.append(f'#{bare}')        # #CC3752
+        candidates.append(bare)              # CC3752
+        candidates.append(f'#{bare.lower()}')# #cc3752
+        candidates.append(bare.lower())      # cc3752
+
+    fields = (
+        'id,order_number,name,created_at,financial_status,fulfillment_status,'
+        'cancelled_at,cancel_reason,total_price,currency,'
+        'tags,note,note_attributes,shipping_address,line_items,customer'
+    )
+
+    last_error = None
+    for name in candidates:
+        url = f'{_base()}/orders.json'
+        params = {'status': 'any', 'name': name, 'limit': 1, 'fields': fields}
+        try:
+            r = requests.get(url, headers=_headers(), params=params, timeout=timeout)
+            if r.status_code >= 400:
+                logger.warning(f'[shopify] order search HTTP {r.status_code} for name={name!r}: {r.text[:200]}')
+                last_error = f'HTTP {r.status_code}'
+                continue
+            orders = r.json().get('orders', []) or []
+            logger.info(f'[shopify] order search name={name!r} → {len(orders)} hit(s)')
+            if orders:
+                return orders[0]
+        except requests.exceptions.RequestException as e:
+            logger.warning(f'[shopify] order search request error for name={name!r}: {e}')
+            last_error = str(e)
+            continue
+
+    logger.info(f'[shopify] order {order_number!r} nao encontrado apos {len(candidates)} tentativas (ultimo erro: {last_error})')
+    return None
+
+
+def list_recent_orders_sample(limit=5, timeout=15):
+    """Diagnostico: lista os N pedidos mais recentes da loja com o campo
+    `name` exposto, pra a gente conferir formato real (com/sem #, com/sem
+    prefixo, etc). Nao usado no fluxo normal — so via /debug/shopify-sample.
+    """
+    if not is_configured():
+        return {'error': 'shopify not configured'}
+
     url = f'{_base()}/orders.json'
     params = {
         'status': 'any',
-        'name': f'#{digits_only}',
-        'limit': 1,
-        'fields': (
-            'id,order_number,name,created_at,financial_status,fulfillment_status,'
-            'cancelled_at,cancel_reason,total_price,currency,'
-            'tags,note,note_attributes,shipping_address,line_items,customer'
-        ),
+        'limit': max(1, min(int(limit), 25)),
+        'fields': 'id,order_number,name,created_at,financial_status,fulfillment_status,tags',
     }
 
     try:
         r = requests.get(url, headers=_headers(), params=params, timeout=timeout)
         if r.status_code >= 400:
-            return None
+            return {
+                'error': f'HTTP {r.status_code}',
+                'detail': r.text[:500],
+                'domain': SHOPIFY_DOMAIN,
+                'api_version': SHOPIFY_API_VERSION,
+            }
         orders = r.json().get('orders', []) or []
-        return orders[0] if orders else None
-    except requests.exceptions.RequestException:
-        return None
+        return {
+            'count': len(orders),
+            'orders': orders,
+            'domain': SHOPIFY_DOMAIN,
+            'api_version': SHOPIFY_API_VERSION,
+            'configured_prefix': SHOPIFY_ORDER_PREFIX,
+        }
+    except requests.exceptions.RequestException as e:
+        return {'error': str(e)}
 
 
 def extract_attrs(order):

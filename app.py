@@ -116,6 +116,31 @@ def root():
     }), 200
 
 
+@app.route('/debug/shopify-sample', methods=['GET'])
+def debug_shopify_sample():
+    """Lista os ultimos N pedidos da Shopify com o campo `name` exposto.
+    Util pra confirmar o formato real dos nomes (ex: '#CC3752' vs 'CC3752').
+    Protegido por INTERNAL_API_TOKEN — defina essa env var no Railway pra
+    habilitar o endpoint. Acesso: ?token=X ou header X-Internal-Token: X.
+    """
+    expected = os.environ.get('INTERNAL_API_TOKEN', '').strip()
+    if not expected:
+        return jsonify({
+            'error': 'INTERNAL_API_TOKEN nao configurado no servidor — '
+                     'defina essa env var no Railway para usar o debug.'
+        }), 503
+
+    provided = (
+        request.args.get('token', '').strip()
+        or request.headers.get('X-Internal-Token', '').strip()
+    )
+    if provided != expected:
+        return jsonify({'error': 'unauthorized'}), 401
+
+    limit = request.args.get('limit', default=5, type=int)
+    return jsonify(shopify_client.list_recent_orders_sample(limit=limit)), 200
+
+
 @app.route('/webhook/zapi', methods=['POST'])
 def webhook_zapi():
     """Webhook publico chamado pela Z-API a cada evento.
