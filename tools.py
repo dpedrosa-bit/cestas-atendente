@@ -10,18 +10,16 @@ REGRA DE OURO: Tools NUNCA podem inventar dados. Sempre consultam fonte real
 O agente usa esse erro para responder honestamente ("não encontrei seu pedido,
 posso transferir para um atendente humano?").
 
-Estado (Fase 1 + Sprint 2): apenas leitura.
+Estado (Fase 1 + Sprint 2 + Sprint 3): apenas leitura.
 - buscar_pedido_por_telefone           [implementado — Shopify Admin REST]
 - buscar_pedido_por_numero             [implementado — Shopify Admin REST]
 - verificar_disponibilidade_entrega    [implementado — via cestas-company/api/atendente/slots]
+- consultar_status_completo            [implementado — via cestas-routes/api/atendente/order-status]
 - escalar_para_humano                  [implementado — apenas marca a sessão]
-
-Próximas fases:
-- status_producao(order_id)        -> via cestas-routes
-- status_entrega(order_id)         -> via cestas-routes (rota, motorista, ETA)
 """
 import shopify_client
 import cestas_company_client
+import cestas_routes_client
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -105,6 +103,43 @@ TOOL_DEFINITIONS = [
                 },
             },
             'required': ['cep'],
+        },
+    },
+    {
+        'name': 'consultar_status_completo',
+        'description': (
+            'Retorna a timeline COMPLETA do pedido com timestamps reais de '
+            'cada transicao (aprovado, em producao, saiu pra entrega, '
+            'entregue, etc) + status atual + endereco + janela de entrega '
+            'agendada. USE essa tool sempre que o cliente perguntar "cade '
+            'meu pedido?", "qual o status?", "ja saiu?", "que horas chega?", '
+            'ou pedir qualquer detalhe sobre o andamento de um pedido '
+            'especifico. Eh a fonte de verdade — nunca afirme status sem '
+            'chamar essa tool antes. '
+            'Retorna `envHistory[]` (track de envio/entrega) e '
+            '`prodHistory[]` (track de producao/montagem) ordenados por '
+            'timestamp. Cada entrada tem `status` e `at` (timestamp no fuso '
+            'de Sao Paulo). Se `timeline_unavailable=true`, eh um pedido '
+            'antigo (anterior a 14/05/2026) — responda com `currentEnv` e '
+            '`currentProd` apenas, avisando que nao tem horarios detalhados. '
+            'Se retornar `error: "not_found"`, peca ao cliente pra confirmar '
+            'o numero (pedidos com mais de 60 dias nao aparecem aqui). '
+            'PRE-REQUISITO: voce precisa do numero do pedido. Se nao tiver, '
+            'use `buscar_pedido_por_telefone` ou `buscar_pedido_por_numero` '
+            'primeiro pra descobrir o numero.'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'order_number': {
+                    'type': 'string',
+                    'description': (
+                        'Numero do pedido. Aceita "CC15377", "#15377" ou '
+                        'apenas "15377" — a tool normaliza.'
+                    ),
+                },
+            },
+            'required': ['order_number'],
         },
     },
     {
@@ -289,6 +324,59 @@ def _tool_verificar_disponibilidade_entrega(input_data, context):
     }
 
 
+def _tool_consultar_status_completo(input_data, context):
+    """Consulta /api/atendente/order-status do cestas-routes. Reaproveita
+    a logica EXATA do painel (extractDeliveryInfo + extractStatusHistory)
+    sem duplicar nada no atendente.
+
+    Retorno otimizado pra Claude:
+    - Mantem envHistory/prodHistory com timestamps brutos pra IA traduzir
+    - Inclui flag timeline_unavailable pra pedidos pre-14/05/2026
+    - Remove campos verbose (orderId, cacheKey, etc) que nao ajudam a IA
+    """
+    order_number = (input_data or {}).get('order_number')
+    if not order_number:
+        return {'error': 'order_number_obrigatorio'}
+
+    if not cestas_routes_client.is_configured():
+        return {
+            'error': 'integracao_indisponivel',
+            'message': 'Sistema de consulta de status temporariamente offline. Escalar pra humano se urgente.',
+        }
+
+    resp = cestas_routes_client.get_order_status(order_number)
+
+    if resp.get('error') == 'not_found':
+        return {
+            'error': 'not_found',
+            'order_number': order_number,
+            'message': resp.get('message') or 'Pedido nao encontrado nos ultimos 60 dias.',
+        }
+
+    if resp.get('error'):
+        return {
+            'error': resp.get('error'),
+            'message': resp.get('message') or 'Falha ao consultar status.',
+        }
+
+    # Resposta enxuta pra IA — corta campos internos
+    return {
+        'pedido': resp.get('id'),
+        'numero': resp.get('orderNumber'),
+        'criado_em': resp.get('createdAt'),
+        'status_envio_atual': resp.get('currentEnv'),
+        'status_producao_atual': resp.get('currentProd'),
+        'timeline_envio': resp.get('envHistory') or [],
+        'timeline_producao': resp.get('prodHistory') or [],
+        'timeline_unavailable': bool(resp.get('timeline_unavailable')),
+        'dados_incompletos': bool(resp.get('incomplete')),
+        'pendencias': resp.get('incompleteIssues') or [],
+        'cliente': resp.get('customer') or {},
+        'endereco': resp.get('address') or {},
+        'entrega_agendada': resp.get('delivery') or {},
+    }
+
+
 def _tool_escalar_para_humano(input_data, context):
     """Marca a sessão como handoff e cria registro em atendente_handoff.
     O envio efetivo de notificação para a equipe (e-mail/Telegram) fica para
@@ -324,6 +412,7 @@ TOOL_IMPL = {
     'buscar_pedido_por_telefone': _tool_buscar_pedido_por_telefone,
     'buscar_pedido_por_numero': _tool_buscar_pedido_por_numero,
     'verificar_disponibilidade_entrega': _tool_verificar_disponibilidade_entrega,
+    'consultar_status_completo': _tool_consultar_status_completo,
     'escalar_para_humano': _tool_escalar_para_humano,
 }
 

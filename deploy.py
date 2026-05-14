@@ -27,6 +27,8 @@ TRACKED_FILES = [
     'anthropic_adapter.py',
     'tools.py',
     'shopify_client.py',
+    'cestas_company_client.py',
+    'cestas_routes_client.py',
     'requirements.txt',
     'Dockerfile',
     'Procfile',
