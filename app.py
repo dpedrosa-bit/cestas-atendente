@@ -6,11 +6,14 @@ e Flower Store. Consome dados reais via Shopify Admin API direto (Fase 1) e,
 em fases posteriores, via cestas-routes/cestas-company.
 
 Estrutura:
-  - GET  /health                          healthcheck (Railway)
-  - POST /webhook/zapi                    alias legacy → /webhook/zapi/cestascompany
-  - POST /webhook/zapi/<shop_slug>        webhook Z-API por loja (cestascompany | flowerstore)
-  - GET  /admin/sessions                  (Sprint 4.2) listagem de sessoes
-  - GET  /admin/handoff                   (Sprint 4.2) fila de escalacao
+  - GET  /health                                  healthcheck (Railway)
+  - POST /webhook/zapi                            alias legacy → /webhook/zapi/cestascompany
+  - POST /webhook/zapi/<shop_slug>                webhook Z-API por loja (cestascompany | flowerstore)
+  - GET  /admin/api/conversations                 lista paginada de sessoes (Sprint 4.2)
+  - GET  /admin/api/conversations/<id>            detalhe + mensagens (Sprint 4.2)
+  - GET  /admin/api/handoffs                      fila de escalacoes pendentes (Sprint 4.2)
+  - GET  /admin/api/metrics                       agregados pro dashboard (Sprint 4.2)
+  Todos /admin/api/* exigem Authorization: Bearer <INTERNAL_API_TOKEN>.
 
 Multi-loja:
   Cada loja tem instancia Z-API propria com webhook apontando para
@@ -27,11 +30,14 @@ REGRAS DE OURO (herdadas dos projetos irmaos):
 """
 import os
 import logging
+from datetime import datetime, timedelta
+from functools import wraps
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from sqlalchemy import func, and_
 
-from models import db, init_db, AtendenteSession
+from models import db, init_db, AtendenteSession, AtendenteMessage, AtendenteHandoff
 import zapi_adapter
 import anthropic_adapter
 import shopify_client
@@ -257,6 +263,347 @@ def webhook_zapi_by_shop(shop_slug):
         /webhook/zapi/flowerstore     (instancia da Flower Store — quando ligar)
     """
     return _handle_zapi_webhook(shop_slug)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API admin — consumida pelo painel do cestasapp via proxy server-side
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _require_internal_token(fn):
+    """Decorator: exige Authorization: Bearer <INTERNAL_API_TOKEN>.
+
+    Usado pra todos endpoints /admin/api/*. O painel do cestasapp chama via
+    proxy server-side (nao expoe o token pro browser).
+    """
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        expected = os.environ.get('INTERNAL_API_TOKEN', '').strip()
+        if not expected:
+            return jsonify({
+                'error': 'INTERNAL_API_TOKEN nao configurado no servidor'
+            }), 503
+
+        auth = request.headers.get('Authorization', '')
+        provided = ''
+        if auth.startswith('Bearer '):
+            provided = auth[len('Bearer '):].strip()
+
+        if provided != expected:
+            return jsonify({'error': 'unauthorized'}), 401
+
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def _iso(dt):
+    """Serializa datetime UTC em ISO 8601 com 'Z'. None -> None."""
+    if dt is None:
+        return None
+    return dt.replace(microsecond=0).isoformat() + 'Z'
+
+
+def _serialize_session_brief(s):
+    """Versao curta de uma sessao — usada na listagem (sem mensagens)."""
+    return {
+        'id': s.id,
+        'shop': s.shop,
+        'channel': s.channel,
+        'phone': s.phone,
+        'status': s.status,
+        'customer_id': s.customer_id,
+        'customer_name': s.customer_name,
+        'turn_count': s.turn_count,
+        'tokens_input_total': s.tokens_input_total,
+        'tokens_output_total': s.tokens_output_total,
+        'cache_read_total': s.cache_read_total,
+        'cache_write_total': s.cache_write_total,
+        'created_at': _iso(s.created_at),
+        'last_message_at': _iso(s.last_message_at),
+        'meta': s.meta or {},
+    }
+
+
+def _serialize_message(m):
+    """Mensagem com todos os blocos necessarios pro front renderizar.
+    Inclui tool_calls (JSONB) pra mostrar o que a IA consultou."""
+    return {
+        'id': m.id,
+        'session_id': m.session_id,
+        'role': m.role,
+        'content': m.content,
+        'tool_calls': m.tool_calls,
+        'model': m.model,
+        'tokens_input': m.tokens_input,
+        'tokens_output': m.tokens_output,
+        'cache_read': m.cache_read,
+        'cache_write': m.cache_write,
+        'external_id': m.external_id,
+        'created_at': _iso(m.created_at),
+    }
+
+
+def _serialize_handoff(h):
+    return {
+        'id': h.id,
+        'session_id': h.session_id,
+        'reason': h.reason,
+        'summary': h.summary,
+        'status': h.status,
+        'assigned_to': h.assigned_to,
+        'created_at': _iso(h.created_at),
+        'resolved_at': _iso(h.resolved_at),
+    }
+
+
+@app.route('/admin/api/conversations', methods=['GET'])
+@_require_internal_token
+def admin_list_conversations():
+    """Lista paginada de sessoes pro painel.
+
+    Query params:
+        shop     filtro por dominio Shopify (recomendado — uma loja por vez)
+        status   filtro por status (active|handoff|human_active|closed|expired)
+        q        busca textual em phone OU customer_name (ILIKE)
+        limit    default 50, max 200
+        offset   default 0
+        order    'last_message' (default) ou 'created'
+
+    Resposta:
+        { "total": N, "limit": ..., "offset": ..., "items": [<session_brief>...] }
+    """
+    if not _DB_OK:
+        return jsonify({'error': 'db unavailable'}), 503
+
+    shop = (request.args.get('shop') or '').strip()
+    status = (request.args.get('status') or '').strip()
+    q = (request.args.get('q') or '').strip()
+
+    try:
+        limit = int(request.args.get('limit', 50))
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 200))
+
+    try:
+        offset = int(request.args.get('offset', 0))
+    except (TypeError, ValueError):
+        offset = 0
+    offset = max(0, offset)
+
+    order = (request.args.get('order') or 'last_message').strip()
+
+    query = AtendenteSession.query
+    if shop:
+        query = query.filter(AtendenteSession.shop == shop)
+    if status:
+        query = query.filter(AtendenteSession.status == status)
+    if q:
+        like = f'%{q}%'
+        query = query.filter(
+            db.or_(
+                AtendenteSession.phone.ilike(like),
+                AtendenteSession.customer_name.ilike(like),
+            )
+        )
+
+    total = query.count()
+
+    if order == 'created':
+        query = query.order_by(AtendenteSession.created_at.desc())
+    else:
+        query = query.order_by(AtendenteSession.last_message_at.desc())
+
+    rows = query.limit(limit).offset(offset).all()
+
+    return jsonify({
+        'total': total,
+        'limit': limit,
+        'offset': offset,
+        'items': [_serialize_session_brief(s) for s in rows],
+    }), 200
+
+
+@app.route('/admin/api/conversations/<int:session_id>', methods=['GET'])
+@_require_internal_token
+def admin_get_conversation(session_id):
+    """Detalhe completo de uma sessao: dados + lista de mensagens
+    (ordenada cronologicamente) + handoffs vinculados.
+
+    Query params:
+        msg_limit   limite de mensagens (default 500). Mensagens mais antigas
+                    do que esse limite ficam de fora — front pode pedir mais
+                    via msg_before_id quando precisar.
+    """
+    if not _DB_OK:
+        return jsonify({'error': 'db unavailable'}), 503
+
+    sess = AtendenteSession.query.get(session_id)
+    if not sess:
+        return jsonify({'error': 'not_found'}), 404
+
+    try:
+        msg_limit = int(request.args.get('msg_limit', 500))
+    except (TypeError, ValueError):
+        msg_limit = 500
+    msg_limit = max(1, min(msg_limit, 2000))
+
+    msgs = (
+        AtendenteMessage.query
+        .filter_by(session_id=sess.id)
+        .order_by(AtendenteMessage.created_at.asc(), AtendenteMessage.id.asc())
+        .limit(msg_limit)
+        .all()
+    )
+
+    handoffs = (
+        AtendenteHandoff.query
+        .filter_by(session_id=sess.id)
+        .order_by(AtendenteHandoff.created_at.asc())
+        .all()
+    )
+
+    return jsonify({
+        'session': _serialize_session_brief(sess),
+        'messages': [_serialize_message(m) for m in msgs],
+        'handoffs': [_serialize_handoff(h) for h in handoffs],
+        'message_count_returned': len(msgs),
+    }), 200
+
+
+@app.route('/admin/api/handoffs', methods=['GET'])
+@_require_internal_token
+def admin_list_handoffs():
+    """Fila de escalacoes. Default mostra pendentes (`status=pending`).
+
+    Query params:
+        shop      filtra pela loja da sessao vinculada
+        status    pending (default) | taken | resolved
+        limit     default 100, max 500
+    """
+    if not _DB_OK:
+        return jsonify({'error': 'db unavailable'}), 503
+
+    shop = (request.args.get('shop') or '').strip()
+    status = (request.args.get('status') or 'pending').strip()
+
+    try:
+        limit = int(request.args.get('limit', 100))
+    except (TypeError, ValueError):
+        limit = 100
+    limit = max(1, min(limit, 500))
+
+    query = (
+        db.session.query(AtendenteHandoff, AtendenteSession)
+        .join(AtendenteSession, AtendenteHandoff.session_id == AtendenteSession.id)
+        .filter(AtendenteHandoff.status == status)
+    )
+    if shop:
+        query = query.filter(AtendenteSession.shop == shop)
+
+    query = query.order_by(AtendenteHandoff.created_at.desc()).limit(limit)
+
+    items = []
+    for h, s in query.all():
+        item = _serialize_handoff(h)
+        item['session'] = _serialize_session_brief(s)
+        items.append(item)
+
+    return jsonify({'items': items, 'count': len(items)}), 200
+
+
+@app.route('/admin/api/metrics', methods=['GET'])
+@_require_internal_token
+def admin_metrics():
+    """Agregados pro dashboard do painel.
+
+    Query params:
+        shop   filtra pela loja (recomendado)
+
+    Resposta:
+        {
+          "now": "2026-05-16T...",
+          "shop": "unicestas-...",
+          "conversations": { "today": N, "last_7d": N, "last_30d": N,
+                             "by_status": { "active": N, "handoff": N, ... } },
+          "handoffs": { "pending": N, "taken": N, "resolved_30d": N },
+          "tokens_7d": { "input": N, "output": N, "cache_read": N, "cache_write": N }
+        }
+    """
+    if not _DB_OK:
+        return jsonify({'error': 'db unavailable'}), 503
+
+    shop = (request.args.get('shop') or '').strip()
+    now = datetime.utcnow()
+    start_today = datetime(now.year, now.month, now.day)
+    start_7d = now - timedelta(days=7)
+    start_30d = now - timedelta(days=30)
+
+    sess_q = AtendenteSession.query
+    if shop:
+        sess_q = sess_q.filter(AtendenteSession.shop == shop)
+
+    today = sess_q.filter(AtendenteSession.created_at >= start_today).count()
+    last_7d = sess_q.filter(AtendenteSession.created_at >= start_7d).count()
+    last_30d = sess_q.filter(AtendenteSession.created_at >= start_30d).count()
+
+    by_status_rows = (
+        sess_q.with_entities(AtendenteSession.status, func.count(AtendenteSession.id))
+              .group_by(AtendenteSession.status)
+              .all()
+    )
+    by_status = {row[0]: row[1] for row in by_status_rows}
+
+    ho_q = (
+        db.session.query(AtendenteHandoff)
+        .join(AtendenteSession, AtendenteHandoff.session_id == AtendenteSession.id)
+    )
+    if shop:
+        ho_q = ho_q.filter(AtendenteSession.shop == shop)
+
+    ho_pending = ho_q.filter(AtendenteHandoff.status == 'pending').count()
+    ho_taken = ho_q.filter(AtendenteHandoff.status == 'taken').count()
+    ho_resolved_30d = ho_q.filter(
+        and_(
+            AtendenteHandoff.status == 'resolved',
+            AtendenteHandoff.resolved_at >= start_30d,
+        )
+    ).count()
+
+    tok_q = (
+        db.session.query(
+            func.coalesce(func.sum(AtendenteMessage.tokens_input), 0),
+            func.coalesce(func.sum(AtendenteMessage.tokens_output), 0),
+            func.coalesce(func.sum(AtendenteMessage.cache_read), 0),
+            func.coalesce(func.sum(AtendenteMessage.cache_write), 0),
+        )
+        .join(AtendenteSession, AtendenteMessage.session_id == AtendenteSession.id)
+        .filter(AtendenteMessage.created_at >= start_7d)
+    )
+    if shop:
+        tok_q = tok_q.filter(AtendenteSession.shop == shop)
+    tok_in, tok_out, tok_cr, tok_cw = tok_q.first()
+
+    return jsonify({
+        'now': _iso(now),
+        'shop': shop or None,
+        'conversations': {
+            'today': today,
+            'last_7d': last_7d,
+            'last_30d': last_30d,
+            'by_status': by_status,
+        },
+        'handoffs': {
+            'pending': ho_pending,
+            'taken': ho_taken,
+            'resolved_30d': ho_resolved_30d,
+        },
+        'tokens_7d': {
+            'input': int(tok_in or 0),
+            'output': int(tok_out or 0),
+            'cache_read': int(tok_cr or 0),
+            'cache_write': int(tok_cw or 0),
+        },
+    }), 200
 
 
 # ─────────────────────────────────────────────────────────────────────────────
