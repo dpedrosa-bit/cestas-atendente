@@ -299,6 +299,11 @@ def _run_tool_loop(session, model, messages):
     tool_context = {
         'session': session,
         'phone': session.phone,
+        # shop e channel plumbed pra tools que precisarem rotear por loja.
+        # Hoje as tools usam SHOPIFY_DOMAIN unico (Cestas Company); quando
+        # Flower Store ligar, tools podem resolver creds via context['shop'].
+        'shop': getattr(session, 'shop', None) or 'unicestas-8762.myshopify.com',
+        'channel': getattr(session, 'channel', None) or 'whatsapp',
     }
 
     final_text_parts = []

@@ -20,8 +20,21 @@ class AtendenteSession(db.Model):
     __tablename__ = 'atendente_sessions'
 
     id = db.Column(db.Integer, primary_key=True)
+    # Loja Shopify dona da conversa (ex: "unicestas-8762.myshopify.com"). Isola
+    # conversas de clientes que compram em mais de uma loja com o mesmo numero.
+    shop = db.Column(db.String(128), nullable=False,
+                     server_default='unicestas-8762.myshopify.com', index=True)
+    # Canal por onde a conversa entra ('whatsapp' hoje; 'email' planejado).
+    # Multi-canal desde o desenho — schema preparado, codigo se vira com whatsapp por ora.
+    channel = db.Column(db.String(16), nullable=False,
+                        server_default='whatsapp', index=True)
     phone = db.Column(db.String(32), nullable=False, index=True)
-    # active | handoff | closed | expired
+    # active | handoff | human_active | closed | expired
+    # active        — IA respondendo
+    # handoff       — escalado, aguardando operador assumir
+    # human_active  — operador esta conversando, IA pausada (Sprint 4.4)
+    # closed        — conversa encerrada manualmente
+    # expired       — TTL expirou (24h sem mensagem)
     status = db.Column(db.String(16), nullable=False, default='active', index=True)
     # Identidade do cliente (preenchido após primeiro lookup com sucesso)
     customer_id = db.Column(db.String(64), nullable=True)
@@ -40,6 +53,15 @@ class AtendenteSession(db.Model):
 
     messages = db.relationship('AtendenteMessage', backref='session', lazy='dynamic',
                                 cascade='all, delete-orphan')
+
+    __table_args__ = (
+        # Listagem do painel por loja, ordenada pelo movimento mais recente
+        db.Index('ix_atendente_sessions_shop_status_lastmsg',
+                 'shop', 'status', 'last_message_at'),
+        # Lookup de sessao ativa por (loja, telefone, canal) — usado a cada webhook
+        db.Index('ix_atendente_sessions_shop_phone_channel',
+                 'shop', 'phone', 'channel'),
+    )
 
 
 class AtendenteMessage(db.Model):

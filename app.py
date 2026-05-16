@@ -6,10 +6,18 @@ e Flower Store. Consome dados reais via Shopify Admin API direto (Fase 1) e,
 em fases posteriores, via cestas-routes/cestas-company.
 
 Estrutura:
-  - GET  /health                  healthcheck (Railway)
-  - POST /webhook/zapi            webhook da Z-API (mensagens recebidas)
-  - GET  /admin/sessions          (Fase 2) listagem de sessoes
-  - GET  /admin/handoff           (Fase 3) fila de escalacao
+  - GET  /health                          healthcheck (Railway)
+  - POST /webhook/zapi                    alias legacy → /webhook/zapi/cestascompany
+  - POST /webhook/zapi/<shop_slug>        webhook Z-API por loja (cestascompany | flowerstore)
+  - GET  /admin/sessions                  (Sprint 4.2) listagem de sessoes
+  - GET  /admin/handoff                   (Sprint 4.2) fila de escalacao
+
+Multi-loja:
+  Cada loja tem instancia Z-API propria com webhook apontando para
+  /webhook/zapi/<shop_slug>. O slug resolve para o dominio Shopify oficial
+  via SHOP_BY_SLUG, gravado em AtendenteSession.shop. Hoje so a Cestas
+  Company esta ativa; o path flowerstore fica pronto pra ligar quando
+  a 2a instancia Z-API for criada.
 
 REGRAS DE OURO (herdadas dos projetos irmaos):
 1. Nunca usar patches auto-correctivos — sempre arquivo completo
@@ -63,16 +71,34 @@ else:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Mapa de loja por slug do webhook
+# ─────────────────────────────────────────────────────────────────────────────
+# Cada loja Shopify roda uma instancia Z-API separada que aponta para um path
+# proprio. Slug → dominio Shopify canonico gravado em AtendenteSession.shop.
+SHOP_BY_SLUG = {
+    'cestascompany': 'unicestas-8762.myshopify.com',
+    # Configurar quando a 2a instancia Z-API for criada com WhatsApp da Flower:
+    'flowerstore':   os.environ.get('FLOWERSTORE_SHOP_DOMAIN', '').strip()
+                     or 'flowerstore.myshopify.com',
+}
+DEFAULT_SHOP_SLUG = 'cestascompany'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Helpers de sessao
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _get_or_create_session(phone, name=''):
-    """Encontra a sessao ativa para esse telefone ou cria uma nova.
-    Sessoes em status 'handoff' ou 'closed' nao sao reutilizadas — nova sessao
-    eh criada (mas preservamos o historico antigo no DB)."""
+def _get_or_create_session(phone, shop, channel='whatsapp', name=''):
+    """Encontra a sessao ativa para (loja, telefone, canal) ou cria uma nova.
+    Sessoes em status 'handoff', 'human_active' ou 'closed' nao sao reutilizadas
+    — nova sessao eh criada (mas preservamos o historico antigo no DB).
+
+    O filtro por `shop` evita vazamento entre lojas quando o mesmo cliente
+    conversa em mais de uma loja com o mesmo numero.
+    """
     sess = (
         AtendenteSession.query
-        .filter_by(phone=phone, status='active')
+        .filter_by(shop=shop, phone=phone, channel=channel, status='active')
         .order_by(AtendenteSession.created_at.desc())
         .first()
     )
@@ -80,6 +106,8 @@ def _get_or_create_session(phone, name=''):
         return sess
 
     sess = AtendenteSession(
+        shop=shop,
+        channel=channel,
         phone=phone,
         status='active',
         customer_name=name or None,
@@ -87,7 +115,8 @@ def _get_or_create_session(phone, name=''):
     )
     db.session.add(sess)
     db.session.commit()
-    logger.info(f'[session] nova sessao criada id={sess.id} phone={phone}')
+    logger.info(f'[session] nova sessao criada id={sess.id} shop={shop} '
+                f'channel={channel} phone={phone}')
     return sess
 
 
@@ -141,12 +170,15 @@ def debug_shopify_sample():
     return jsonify(shopify_client.list_recent_orders_sample(limit=limit)), 200
 
 
-@app.route('/webhook/zapi', methods=['POST'])
-def webhook_zapi():
-    """Webhook publico chamado pela Z-API a cada evento.
-    Padrao: responder 200 rapido para a Z-API nao retentar — o processamento
-    pode demorar alguns segundos por causa da chamada ao Claude.
+def _handle_zapi_webhook(shop_slug):
+    """Logica do webhook compartilhada entre rota legacy e rota por loja.
+    Resolve o dominio Shopify a partir do slug e roda IA / handoff.
     """
+    shop_domain = SHOP_BY_SLUG.get(shop_slug)
+    if not shop_domain:
+        logger.warning(f'[webhook] shop_slug desconhecido: {shop_slug}')
+        return jsonify({'ok': False, 'error': 'unknown shop slug'}), 404
+
     payload = request.get_json(silent=True) or {}
     parsed = zapi_adapter.parse_webhook(payload)
 
@@ -163,10 +195,11 @@ def webhook_zapi():
     name = parsed.get('name', '')
     msg_id = parsed.get('message_id', '')
 
-    logger.info(f'[webhook] phone={phone} text={text[:80]!r} msg_id={msg_id}')
+    logger.info(f'[webhook] shop={shop_slug} phone={phone} '
+                f'text={text[:80]!r} msg_id={msg_id}')
 
     try:
-        session = _get_or_create_session(phone, name=name)
+        session = _get_or_create_session(phone, shop_domain, name=name)
 
         # Atualiza last_message_at e nome do cliente se vier
         from datetime import datetime
@@ -175,8 +208,8 @@ def webhook_zapi():
             session.customer_name = name
         db.session.commit()
 
-        # Sessao em handoff: nao responder automaticamente, apenas registrar
-        if session.status == 'handoff':
+        # Sessao em handoff/human_active: nao responder automaticamente, apenas registrar
+        if session.status in ('handoff', 'human_active'):
             from models import AtendenteMessage
             db.session.add(AtendenteMessage(
                 session_id=session.id,
@@ -185,7 +218,8 @@ def webhook_zapi():
                 external_id=msg_id,
             ))
             db.session.commit()
-            logger.info(f'[webhook] msg em sessao {session.id} (handoff) — nao respondendo')
+            logger.info(f'[webhook] msg em sessao {session.id} '
+                        f'({session.status}) — nao respondendo')
             return jsonify({'ok': True, 'handoff': True}), 200
 
         # Roda IA + tool loop
@@ -196,7 +230,8 @@ def webhook_zapi():
             if not ok:
                 logger.error(f'[webhook] falha envio Z-API: {info}')
             else:
-                logger.info(f'[webhook] resposta enviada para {phone} ({len(reply)} chars)')
+                logger.info(f'[webhook] resposta enviada para {phone} '
+                            f'({len(reply)} chars)')
 
         return jsonify({'ok': True, 'session_id': session.id}), 200
 
@@ -204,6 +239,24 @@ def webhook_zapi():
         logger.exception(f'[webhook] erro inesperado: {e}')
         # Sempre 200 para Z-API nao retentar — erro fica no log
         return jsonify({'ok': False, 'error': str(e)[:200]}), 200
+
+
+@app.route('/webhook/zapi', methods=['POST'])
+def webhook_zapi_legacy():
+    """Alias legacy: webhook unico antes do multi-loja (Sprint 4.1). A Z-API
+    da Cestas Company segue apontando pra ca; quando atualizar o webhook
+    URL no painel da Z-API, passa a usar /webhook/zapi/cestascompany.
+    """
+    return _handle_zapi_webhook(DEFAULT_SHOP_SLUG)
+
+
+@app.route('/webhook/zapi/<shop_slug>', methods=['POST'])
+def webhook_zapi_by_shop(shop_slug):
+    """Webhook Z-API por loja. Cada instancia Z-API tem URL propria:
+        /webhook/zapi/cestascompany   (instancia da Cestas Company)
+        /webhook/zapi/flowerstore     (instancia da Flower Store — quando ligar)
+    """
+    return _handle_zapi_webhook(shop_slug)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
