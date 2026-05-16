@@ -13,6 +13,9 @@ Estrutura:
   - GET  /admin/api/conversations/<id>            detalhe + mensagens (Sprint 4.2)
   - GET  /admin/api/handoffs                      fila de escalacoes pendentes (Sprint 4.2)
   - GET  /admin/api/metrics                       agregados pro dashboard (Sprint 4.2)
+  - POST /admin/api/conversations/<id>/takeover   operador assume a conversa (Sprint 4.4)
+  - POST /admin/api/conversations/<id>/release    operador devolve pra IA (Sprint 4.4)
+  - POST /admin/api/conversations/<id>/send       operador envia mensagem via Z-API (Sprint 4.4)
   Todos /admin/api/* exigem Authorization: Bearer <INTERNAL_API_TOKEN>.
 
 Multi-loja:
@@ -603,6 +606,158 @@ def admin_metrics():
             'cache_read': int(tok_cr or 0),
             'cache_write': int(tok_cw or 0),
         },
+    }), 200
+
+
+@app.route('/admin/api/conversations/<int:session_id>/takeover', methods=['POST'])
+@_require_internal_token
+def admin_takeover(session_id):
+    """Operador assume a conversa: status -> human_active, IA fica muda.
+    Resolve os handoffs pendentes vinculados.
+
+    Body opcional (JSON):
+        { "operator": "nome@email" }   — registrado em assigned_to dos handoffs
+    """
+    if not _DB_OK:
+        return jsonify({'error': 'db unavailable'}), 503
+
+    sess = AtendenteSession.query.get(session_id)
+    if not sess:
+        return jsonify({'error': 'not_found'}), 404
+
+    if sess.status == 'human_active':
+        return jsonify({'ok': True, 'already': True,
+                        'session': _serialize_session_brief(sess)}), 200
+
+    body = request.get_json(silent=True) or {}
+    operator = (body.get('operator') or '').strip()[:128] or None
+
+    sess.status = 'human_active'
+
+    # Marca handoffs pending desta sessao como 'taken'
+    now = datetime.utcnow()
+    pendings = AtendenteHandoff.query.filter_by(
+        session_id=sess.id, status='pending'
+    ).all()
+    for h in pendings:
+        h.status = 'taken'
+        if operator:
+            h.assigned_to = operator
+
+    db.session.commit()
+    logger.info(f'[admin] takeover sess={sess.id} operator={operator!r} '
+                f'handoffs_atualizados={len(pendings)}')
+
+    return jsonify({
+        'ok': True,
+        'session': _serialize_session_brief(sess),
+        'handoffs_taken': len(pendings),
+    }), 200
+
+
+@app.route('/admin/api/conversations/<int:session_id>/release', methods=['POST'])
+@_require_internal_token
+def admin_release(session_id):
+    """Operador devolve a conversa pra IA: status human_active -> active.
+
+    Body opcional (JSON):
+        { "resolve_handoffs": true }   — marca handoffs taken como resolved
+    """
+    if not _DB_OK:
+        return jsonify({'error': 'db unavailable'}), 503
+
+    sess = AtendenteSession.query.get(session_id)
+    if not sess:
+        return jsonify({'error': 'not_found'}), 404
+
+    body = request.get_json(silent=True) or {}
+    resolve = bool(body.get('resolve_handoffs', True))
+
+    sess.status = 'active'
+
+    handoffs_resolved = 0
+    if resolve:
+        now = datetime.utcnow()
+        rows = AtendenteHandoff.query.filter_by(
+            session_id=sess.id, status='taken'
+        ).all()
+        for h in rows:
+            h.status = 'resolved'
+            h.resolved_at = now
+            handoffs_resolved += 1
+
+    db.session.commit()
+    logger.info(f'[admin] release sess={sess.id} '
+                f'handoffs_resolved={handoffs_resolved}')
+
+    return jsonify({
+        'ok': True,
+        'session': _serialize_session_brief(sess),
+        'handoffs_resolved': handoffs_resolved,
+    }), 200
+
+
+@app.route('/admin/api/conversations/<int:session_id>/send', methods=['POST'])
+@_require_internal_token
+def admin_send(session_id):
+    """Operador envia mensagem manual pelo Z-API e grava no historico.
+
+    Exige que a sessao esteja em status 'human_active' — protege contra envio
+    enquanto a IA esta no controle (evita duas vozes simultaneas).
+
+    Body (JSON):
+        { "text": "mensagem...", "operator": "nome@email" }
+    """
+    if not _DB_OK:
+        return jsonify({'error': 'db unavailable'}), 503
+
+    sess = AtendenteSession.query.get(session_id)
+    if not sess:
+        return jsonify({'error': 'not_found'}), 404
+
+    if sess.status != 'human_active':
+        return jsonify({
+            'error': 'invalid_state',
+            'message': 'Assuma a conversa antes de enviar mensagens.',
+            'current_status': sess.status,
+        }), 409
+
+    body = request.get_json(silent=True) or {}
+    text = (body.get('text') or '').strip()
+    if not text:
+        return jsonify({'error': 'empty_text'}), 400
+    if len(text) > 4000:
+        return jsonify({'error': 'text_too_long', 'max': 4000}), 400
+
+    operator = (body.get('operator') or '').strip()[:128] or None
+
+    # 1. Envia via Z-API
+    ok, info = zapi_adapter.send_text(sess.phone, text)
+    if not ok:
+        logger.error(f'[admin] send falhou sess={sess.id}: {info}')
+        return jsonify({'error': 'zapi_send_failed', 'detail': str(info)[:300]}), 502
+
+    # 2. Grava no historico como role='human' pra distinguir de assistant (IA)
+    msg = AtendenteMessage(
+        session_id=sess.id,
+        role='human',
+        content=text,
+        external_id=(info or {}).get('messageId') or (info or {}).get('id'),
+        # operador fica no tool_calls (campo JSONB livre) pra nao mexer no schema
+        tool_calls={'operator': operator} if operator else None,
+    )
+    db.session.add(msg)
+    sess.last_message_at = datetime.utcnow()
+    sess.turn_count = (sess.turn_count or 0) + 1
+    db.session.commit()
+
+    logger.info(f'[admin] send sess={sess.id} operator={operator!r} '
+                f'len={len(text)}')
+
+    return jsonify({
+        'ok': True,
+        'message_id': msg.id,
+        'external_id': msg.external_id,
     }), 200
 
 

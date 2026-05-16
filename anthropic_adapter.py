@@ -184,6 +184,12 @@ def _load_history(session):
         if r.role == 'user':
             messages.append({'role': 'user', 'content': r.content})
             i += 1
+        elif r.role == 'human':
+            # Mensagem enviada manualmente pelo operador durante handoff (Sprint 4.4).
+            # Aparece pra IA como uma mensagem de assistant — quando devolverem a
+            # conversa, IA enxerga o contexto do que humano respondeu.
+            messages.append({'role': 'assistant', 'content': r.content or ''})
+            i += 1
         elif r.role == 'assistant':
             blocks = []
             if r.content:
