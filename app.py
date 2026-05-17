@@ -16,6 +16,8 @@ Estrutura:
   - POST /admin/api/conversations/<id>/takeover   operador assume a conversa (Sprint 4.4)
   - POST /admin/api/conversations/<id>/release    operador devolve pra IA (Sprint 4.4)
   - POST /admin/api/conversations/<id>/send       operador envia mensagem via Z-API (Sprint 4.4)
+  - GET  /admin/api/manual                        le manual da loja (Sprint 5.1)
+  - PUT  /admin/api/manual                        atualiza manual da loja (Sprint 5.1)
   Todos /admin/api/* exigem Authorization: Bearer <INTERNAL_API_TOKEN>.
 
 Multi-loja:
@@ -40,7 +42,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from sqlalchemy import func, and_
 
-from models import db, init_db, AtendenteSession, AtendenteMessage, AtendenteHandoff
+from models import db, init_db, AtendenteSession, AtendenteMessage, AtendenteHandoff, AtendenteStoreManual
 import zapi_adapter
 import anthropic_adapter
 import shopify_client
@@ -758,6 +760,86 @@ def admin_send(session_id):
         'ok': True,
         'message_id': msg.id,
         'external_id': msg.external_id,
+    }), 200
+
+
+@app.route('/admin/api/manual', methods=['GET'])
+@_require_internal_token
+def admin_get_manual():
+    """Le o manual da loja. Query: ?shop=<dominio>. Cria registro vazio se ainda
+    nao existir — facilita o frontend (sempre tem algo pra editar)."""
+    if not _DB_OK:
+        return jsonify({'error': 'db unavailable'}), 503
+
+    shop = (request.args.get('shop') or '').strip()
+    if not shop:
+        return jsonify({'error': 'shop_required'}), 400
+
+    row = AtendenteStoreManual.query.filter_by(shop=shop).first()
+    if not row:
+        return jsonify({
+            'shop': shop,
+            'manual_text': '',
+            'updated_at': None,
+            'updated_by': None,
+            'exists': False,
+        }), 200
+
+    return jsonify({
+        'shop': row.shop,
+        'manual_text': row.manual_text or '',
+        'updated_at': _iso(row.updated_at),
+        'updated_by': row.updated_by,
+        'exists': True,
+    }), 200
+
+
+@app.route('/admin/api/manual', methods=['PUT'])
+@_require_internal_token
+def admin_put_manual():
+    """Atualiza o manual da loja. Upsert (cria se nao existir).
+    Body JSON: { shop, manual_text, updated_by? }
+    Limite: 20.000 caracteres pra evitar abuso e estourar contexto da IA.
+    """
+    if not _DB_OK:
+        return jsonify({'error': 'db unavailable'}), 503
+
+    body = request.get_json(silent=True) or {}
+    shop = (body.get('shop') or '').strip()
+    if not shop:
+        return jsonify({'error': 'shop_required'}), 400
+
+    manual_text = body.get('manual_text', '') or ''
+    if len(manual_text) > 20000:
+        return jsonify({'error': 'too_long', 'max': 20000,
+                        'current': len(manual_text)}), 400
+
+    updated_by = (body.get('updated_by') or '').strip()[:128] or None
+
+    row = AtendenteStoreManual.query.filter_by(shop=shop).first()
+    if row:
+        row.manual_text = manual_text
+        row.updated_by = updated_by
+    else:
+        row = AtendenteStoreManual(shop=shop, manual_text=manual_text,
+                                    updated_by=updated_by)
+        db.session.add(row)
+    db.session.commit()
+
+    # Invalida cache do adapter pra refletir mudanca rapidamente
+    try:
+        anthropic_adapter.invalidate_manual_cache(shop)
+    except Exception as e:
+        logger.warning(f'[manual] invalidate_cache falhou: {e}')
+
+    logger.info(f'[manual] atualizado shop={shop} len={len(manual_text)} '
+                f'updated_by={updated_by!r}')
+
+    return jsonify({
+        'shop': row.shop,
+        'manual_text': row.manual_text,
+        'updated_at': _iso(row.updated_at),
+        'updated_by': row.updated_by,
     }), 200
 
 

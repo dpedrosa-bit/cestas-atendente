@@ -29,7 +29,7 @@ import logging
 
 import anthropic
 
-from models import db, AtendenteMessage
+from models import db, AtendenteMessage, AtendenteStoreManual
 from tools import TOOL_DEFINITIONS, run_tool
 
 logger = logging.getLogger(__name__)
@@ -144,19 +144,66 @@ LIMITE: maximo 20 mensagens por sessao. Se chegar perto disso e ainda nao resolv
 """
 
 
-def _build_system_blocks():
+# Cache em memoria do manual por loja — evita query a cada turno.
+# Estrutura: { shop: (manual_text, expires_at_unix) }
+_MANUAL_CACHE = {}
+_MANUAL_CACHE_TTL_SEC = 60
+
+
+def invalidate_manual_cache(shop=None):
+    """Limpa o cache do manual. Chamado quando o painel atualiza o texto.
+    Sem shop, limpa tudo."""
+    if shop is None:
+        _MANUAL_CACHE.clear()
+    else:
+        _MANUAL_CACHE.pop(shop, None)
+
+
+def _load_store_manual(shop):
+    """Le o manual da loja com cache em memoria de TTL pequeno.
+    Retorna string vazia se nao encontrar ou se DB falhar."""
+    if not shop:
+        return ''
+    now = time.time()
+    cached = _MANUAL_CACHE.get(shop)
+    if cached and cached[1] > now:
+        return cached[0]
+    try:
+        row = AtendenteStoreManual.query.filter_by(shop=shop).first()
+        text = (row.manual_text if row else '') or ''
+    except Exception as e:
+        logger.warning(f'[manual] falha ao carregar shop={shop}: {e}')
+        text = ''
+    _MANUAL_CACHE[shop] = (text, now + _MANUAL_CACHE_TTL_SEC)
+    return text
+
+
+def _build_system_blocks(shop=None):
     """System prompt como lista de blocks com cache_control no ultimo.
     Render order: tools -> system -> messages. O breakpoint aqui cacheia
-    tools+system juntos (~1.2k tokens, dentro do minimo de 4096 do Haiku 4.5
-    so se somar com tools — verificar usage.cache_creation no primeiro turno
-    e ajustar se nao bater)."""
-    return [
-        {
+    tools+system juntos.
+
+    Quando ha manual da loja cadastrado, ele eh injetado como bloco adicional
+    ANTES do cache breakpoint — ou seja, faz parte do bloco cacheado. Mudar
+    o manual invalida o cache da loja (ate 5min de TTL ephemeral), mas pra
+    isso temos o invalidate_manual_cache() acionado no PUT.
+    """
+    blocks = [{'type': 'text', 'text': SYSTEM_PROMPT}]
+
+    manual = _load_store_manual(shop)
+    if manual.strip():
+        blocks.append({
             'type': 'text',
-            'text': SYSTEM_PROMPT,
-            'cache_control': {'type': 'ephemeral'},
-        }
-    ]
+            'text': ('\n\n=== MANUAL DA LOJA (operador definiu via painel) ===\n'
+                     'Use estas informacoes como fonte de verdade sobre a loja '
+                     'e seus produtos/politicas. NAO contradiga o manual. Se '
+                     'o cliente perguntar algo coberto aqui, responda direto '
+                     'sem escalar.\n\n' + manual.strip()),
+        })
+
+    # cache_control no ULTIMO bloco — cacheia tudo acima (system + manual + tools)
+    blocks[-1]['cache_control'] = {'type': 'ephemeral'}
+    return blocks
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -314,12 +361,13 @@ def _run_tool_loop(session, model, messages):
 
     final_text_parts = []
 
+    shop = tool_context.get('shop')
     for loop_idx in range(MAX_TOOL_LOOPS):
         try:
             response = client.messages.create(
                 model=model,
                 max_tokens=MAX_TOKENS_OUTPUT,
-                system=_build_system_blocks(),
+                system=_build_system_blocks(shop=shop),
                 tools=TOOL_DEFINITIONS,
                 messages=messages,
             )

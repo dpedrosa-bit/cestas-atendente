@@ -91,6 +91,24 @@ class AtendenteMessage(db.Model):
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
 
 
+class AtendenteStoreManual(db.Model):
+    """Manual da loja (texto livre injetado no system prompt da IA).
+    Uma entrada por shop. Editavel pelo painel sem necessidade de deploy.
+
+    Cache: anthropic_adapter le essa tabela e mantem cache em memoria de
+    60s pra nao consultar DB a cada turno. Mudou pelo painel? Maximo 60s
+    de delay ate o atendente refletir.
+    """
+    __tablename__ = 'atendente_store_manual'
+
+    id = db.Column(db.Integer, primary_key=True)
+    shop = db.Column(db.String(128), nullable=False, unique=True, index=True)
+    manual_text = db.Column(db.Text, nullable=False, default='')
+    updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow,
+                            onupdate=datetime.utcnow)
+    updated_by = db.Column(db.String(128), nullable=True)
+
+
 class AtendenteHandoff(db.Model):
     __tablename__ = 'atendente_handoff'
 
