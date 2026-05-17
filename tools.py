@@ -143,6 +143,49 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        'name': 'buscar_produtos',
+        'description': (
+            'Busca produtos REAIS no catalogo da loja por palavra-chave. USE '
+            'quando o cliente perguntar "que cestas voces tem para X?", "qual '
+            'indicam para [pessoa/ocasiao]?", "tem alguma cesta de [tipo]?", '
+            '"o que voces oferecem para [data]?", ou quando ele falar do que '
+            'esta procurando (aniversario, mae, condolencias, gourmet, vinho, '
+            'cafe, infantil, romantico, etc). Retorna ate 5 produtos com nome, '
+            'preco, link publico, descricao curta e foto. '
+            'COMO RESPONDER ao cliente apos chamar a tool: '
+            '1) Mostre 2-4 opcoes (nao todas as 5, sobrecarrega) escolhendo '
+            'as mais alinhadas com o que o cliente disse. '
+            '2) Use formato WhatsApp limpo:\n'
+            '   *Nome do produto* — R$ XX,XX\n'
+            '   link.do.produto\n\n'
+            '3) Em uma linha curta, mencione o destaque do produto (sabores, '
+            'composicao) so se vier na `description` da tool. NAO invente '
+            'caracteristicas. '
+            '4) Pergunte se ele quer ver mais opcoes ou se ja decidiu. '
+            'Se a tool retornar lista vazia, peca mais detalhes do que o '
+            'cliente procura ou escale.'
+        ),
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'query': {
+                    'type': 'string',
+                    'description': (
+                        'Palavra-chave da busca, 1-3 palavras. Use termos da '
+                        'loja: "aniversario", "vinho", "mae", "infantil", '
+                        '"cafe", "gourmet", "romantica", "condolencias", '
+                        '"chocolate". NAO use frases longas, so palavras-chave.'
+                    ),
+                },
+                'max_results': {
+                    'type': 'integer',
+                    'description': 'Quantos retornar (1-5). Default 5.',
+                },
+            },
+            'required': ['query'],
+        },
+    },
+    {
         'name': 'escalar_para_humano',
         'description': (
             'Sinaliza que esta conversa precisa de atenção humana. Use quando: '
@@ -377,6 +420,37 @@ def _tool_consultar_status_completo(input_data, context):
     }
 
 
+def _tool_buscar_produtos(input_data, context):
+    """Busca catalogo Shopify por termo. Reaproveita shopify_client.search_products
+    + summarize_product pra padronizar o payload da resposta."""
+    query = ((input_data or {}).get('query') or '').strip()
+    if not query:
+        return {'error': 'query_vazia', 'products': []}
+
+    if not shopify_client.is_configured():
+        return {
+            'error': 'shopify_nao_configurado',
+            'products': [],
+            'message': 'Catalogo indisponivel no momento.',
+        }
+
+    try:
+        max_results = int((input_data or {}).get('max_results') or 5)
+    except (TypeError, ValueError):
+        max_results = 5
+    max_results = max(1, min(max_results, 5))
+
+    raw = shopify_client.search_products(query, max_results=max_results)
+    summarized = [shopify_client.summarize_product(p) for p in raw if p]
+    summarized = [s for s in summarized if s and s.get('title')]
+
+    return {
+        'query': query,
+        'count': len(summarized),
+        'products': summarized,
+    }
+
+
 def _tool_escalar_para_humano(input_data, context):
     """Marca a sessão como handoff e cria registro em atendente_handoff.
     O envio efetivo de notificação para a equipe (e-mail/Telegram) fica para
@@ -413,6 +487,7 @@ TOOL_IMPL = {
     'buscar_pedido_por_numero': _tool_buscar_pedido_por_numero,
     'verificar_disponibilidade_entrega': _tool_verificar_disponibilidade_entrega,
     'consultar_status_completo': _tool_consultar_status_completo,
+    'buscar_produtos': _tool_buscar_produtos,
     'escalar_para_humano': _tool_escalar_para_humano,
 }
 

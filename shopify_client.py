@@ -9,6 +9,7 @@ flexiveis, mas para o MVP REST + multiplas variantes resolve.
 API version travada em 2024-10 (igual cestas-routes).
 """
 import os
+import re
 import logging
 import requests
 
@@ -20,6 +21,9 @@ SHOPIFY_API_VERSION = os.environ.get('SHOPIFY_API_VERSION', '2024-10')
 # Prefixo da numeracao da loja (ex: "CC" para Cestas Company -> pedidos #CC3752).
 # Vazio para lojas sem prefixo. Cliente pode digitar com ou sem o prefixo.
 SHOPIFY_ORDER_PREFIX = os.environ.get('SHOPIFY_ORDER_PREFIX', '').strip().upper()
+# Dominio publico da loja (frente Shopify) — usado pra montar link de produto.
+# Cestas Company: cestascompany.com.br. Quando Flower entrar: setar env.
+PUBLIC_DOMAIN = os.environ.get('CESTAS_PUBLIC_DOMAIN', 'cestascompany.com.br').strip()
 
 
 def is_configured():
@@ -272,4 +276,132 @@ def summarize_order(order):
         'gift_message': attrs.get('Mensagem') or attrs.get('Mensagem de presente') or '',
         'items': items,
         'note': order.get('note') or '',
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Busca de produtos (Sprint 5.2 — tool buscar_produtos)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Palavras-chave que indicam produto auxiliar (frete, taxa) — nao devem ser
+# sugeridos ao cliente como cesta/presente.
+_PRODUCT_EXCLUDE_KEYWORDS = ('frete', 'shipping', 'taxa de entrega', 'envio')
+
+
+def _is_excluded_product(product):
+    """Heuristica simples: exclui produtos auxiliares do catalogo nas sugestoes."""
+    title = (product.get('title') or '').lower()
+    ptype = (product.get('product_type') or '').lower()
+    if ptype in ('frete', 'shipping'):
+        return True
+    for kw in _PRODUCT_EXCLUDE_KEYWORDS:
+        if kw in title:
+            return True
+    return False
+
+
+def search_products(query, max_results=5, timeout=15):
+    """Busca produtos no catalogo Shopify por correspondencia de titulo.
+    Retorna ate `max_results` produtos publicados/ativos, excluindo produtos
+    auxiliares (frete). Lista vazia se nada bater ou em caso de erro.
+    """
+    if not is_configured() or not query:
+        return []
+
+    q = str(query).strip()
+    if not q:
+        return []
+
+    url = f'{_base()}/products.json'
+    # Pede o dobro do limite pra ter buffer apos excluir auxiliares
+    api_limit = max(5, min(int(max_results) * 2, 30))
+    params = {
+        'title': q,
+        'limit': api_limit,
+        'status': 'active',
+        'published_status': 'published',
+        'fields': 'id,title,handle,product_type,vendor,tags,images,variants,body_html',
+    }
+
+    try:
+        r = requests.get(url, headers=_headers(), params=params, timeout=timeout)
+        if r.status_code >= 400:
+            logger.warning(f'[shopify] product search HTTP {r.status_code} '
+                            f'query={q!r}: {r.text[:200]}')
+            return []
+        products = r.json().get('products', []) or []
+    except requests.exceptions.RequestException as e:
+        logger.warning(f'[shopify] product search request error: {e}')
+        return []
+
+    filtered = []
+    for p in products:
+        if _is_excluded_product(p):
+            continue
+        filtered.append(p)
+        if len(filtered) >= max_results:
+            break
+
+    logger.info(f'[shopify] product search query={q!r} → '
+                f'{len(products)} raw, {len(filtered)} apos filtro')
+    return filtered
+
+
+def _strip_html(html):
+    """Remove tags HTML e normaliza espacos. Pra encurtar descricoes longas."""
+    if not html:
+        return ''
+    text = re.sub(r'<[^>]+>', ' ', html)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def summarize_product(product):
+    """Resume um produto pro tool result — campos essenciais pro cliente."""
+    if not product:
+        return None
+
+    variants = product.get('variants') or []
+    price_label = ''
+    price_min = None
+    price_max = None
+    if variants:
+        prices = []
+        for v in variants:
+            try:
+                p = float(v.get('price') or 0)
+                if p > 0:
+                    prices.append(p)
+            except (TypeError, ValueError):
+                continue
+        if prices:
+            price_min = min(prices)
+            price_max = max(prices)
+            if abs(price_max - price_min) < 0.01:
+                price_label = f'R$ {price_min:.2f}'.replace('.', ',')
+            else:
+                price_label = (f'R$ {price_min:.2f} a R$ {price_max:.2f}'
+                                .replace('.', ','))
+
+    images = product.get('images') or []
+    image_url = images[0].get('src') if images else None
+
+    description = _strip_html(product.get('body_html') or '')
+    if len(description) > 240:
+        description = description[:237].rstrip() + '...'
+
+    handle = product.get('handle') or ''
+    link = f'https://{PUBLIC_DOMAIN}/products/{handle}' if (handle and PUBLIC_DOMAIN) else None
+
+    return {
+        'title': product.get('title'),
+        'handle': handle,
+        'link': link,
+        'price': price_label,
+        'price_min': price_min,
+        'price_max': price_max,
+        'image_url': image_url,
+        'description': description,
+        'product_type': product.get('product_type'),
+        'vendor': product.get('vendor'),
     }
