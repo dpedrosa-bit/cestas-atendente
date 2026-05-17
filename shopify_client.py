@@ -10,6 +10,7 @@ API version travada em 2024-10 (igual cestas-routes).
 """
 import os
 import re
+import unicodedata
 import logging
 import requests
 
@@ -300,51 +301,157 @@ def _is_excluded_product(product):
     return False
 
 
+def _strip_accents(s):
+    """Remove acentos pra gerar variante da query (aniversário -> aniversario)."""
+    if not s:
+        return s
+    nfkd = unicodedata.normalize('NFKD', s)
+    return ''.join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def _query_variants(query):
+    """Gera ate 4 variantes da query pro filtro `title=` do Shopify REST.
+    O endpoint faz match parcial case-insensitive mas e sensivel a acentos —
+    entao precisamos tentar com e sem acentuacao.
+    Ex: 'Aniversário' -> ['Aniversario', 'Aniversário', 'aniversario', 'aniversario'].
+    """
+    q = (query or '').strip()
+    if not q:
+        return []
+    no_accent = _strip_accents(q)
+    out = []
+    seen = set()
+    for v in (q, no_accent, q.lower(), no_accent.lower()):
+        v = (v or '').strip()
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+_PRODUCT_SEARCH_GQL = """
+query SearchProducts($q: String!, $first: Int!) {
+  products(first: $first, query: $q) {
+    edges {
+      node {
+        id
+        title
+        handle
+        productType
+        vendor
+        tags
+        status
+        descriptionHtml
+        featuredImage { url }
+        variants(first: 5) {
+          edges { node { id price } }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def _graphql(query_str, variables=None, timeout=15):
+    """Executa query GraphQL na Admin API. Retorna (data, error_msg).
+    error_msg eh None em caso de sucesso."""
+    url = f'https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/graphql.json'
+    body = {'query': query_str}
+    if variables:
+        body['variables'] = variables
+    try:
+        r = requests.post(url, headers=_headers(), json=body, timeout=timeout)
+        if r.status_code >= 400:
+            return None, f'HTTP {r.status_code}: {r.text[:300]}'
+        payload = r.json()
+        if payload.get('errors'):
+            return None, str(payload['errors'])[:300]
+        return payload.get('data'), None
+    except requests.exceptions.RequestException as e:
+        return None, f'request error: {e}'
+
+
+def _gql_node_to_rest(node):
+    """Converte node GraphQL pro shape REST-like que summarize_product espera."""
+    fi = node.get('featuredImage') or {}
+    images = [{'src': fi.get('url')}] if fi.get('url') else []
+
+    variants = []
+    v_edges = ((node.get('variants') or {}).get('edges')) or []
+    for ve in v_edges:
+        v = ve.get('node') or {}
+        variants.append({'price': v.get('price')})
+
+    return {
+        'id': node.get('id'),
+        'title': node.get('title') or '',
+        'handle': node.get('handle') or '',
+        'product_type': node.get('productType') or '',
+        'vendor': node.get('vendor') or '',
+        'tags': ','.join(node.get('tags') or []),
+        'images': images,
+        'variants': variants,
+        'body_html': node.get('descriptionHtml') or '',
+    }
+
+
 def search_products(query, max_results=5, timeout=15):
-    """Busca produtos no catalogo Shopify por correspondencia de titulo.
-    Retorna ate `max_results` produtos publicados/ativos, excluindo produtos
-    auxiliares (frete). Lista vazia se nada bater ou em caso de erro.
+    """Busca produtos via GraphQL search da Admin API.
+
+    O Shopify GraphQL `products(query: ...)` faz busca full-text em title,
+    vendor, product_type e tags — muito mais robusto que o filtro `title=`
+    do REST. Tenta variantes com/sem acento pra cobrir Unicode quirks.
+
+    Retorna lista de produtos no shape REST-like (compativel com
+    summarize_product).
     """
     if not is_configured() or not query:
         return []
 
-    q = str(query).strip()
-    if not q:
+    variants = _query_variants(query)
+    if not variants:
         return []
 
-    url = f'{_base()}/products.json'
-    # Pede o dobro do limite pra ter buffer apos excluir auxiliares
-    api_limit = max(5, min(int(max_results) * 2, 30))
-    params = {
-        'title': q,
-        'limit': api_limit,
-        'status': 'active',
-        'published_status': 'published',
-        'fields': 'id,title,handle,product_type,vendor,tags,images,variants,body_html',
-    }
+    api_first = max(5, min(int(max_results) * 2, 20))
+    seen_ids = set()
+    accumulated = []
 
-    try:
-        r = requests.get(url, headers=_headers(), params=params, timeout=timeout)
-        if r.status_code >= 400:
-            logger.warning(f'[shopify] product search HTTP {r.status_code} '
-                            f'query={q!r}: {r.text[:200]}')
-            return []
-        products = r.json().get('products', []) or []
-    except requests.exceptions.RequestException as e:
-        logger.warning(f'[shopify] product search request error: {e}')
-        return []
-
-    filtered = []
-    for p in products:
-        if _is_excluded_product(p):
+    for v_idx, v in enumerate(variants):
+        # Search syntax do Shopify: termo livre + filtro de status
+        search_q = f'{v} status:active'
+        data, err = _graphql(
+            _PRODUCT_SEARCH_GQL,
+            variables={'q': search_q, 'first': api_first},
+            timeout=timeout,
+        )
+        if err:
+            logger.warning(f'[shopify] gql search variant={v!r} error: {err}')
             continue
-        filtered.append(p)
-        if len(filtered) >= max_results:
+
+        edges = ((data or {}).get('products') or {}).get('edges') or []
+        logger.info(f'[shopify] gql search query={query!r} variant#{v_idx}='
+                    f'{search_q!r} → {len(edges)} hit(s)')
+
+        for edge in edges:
+            node = edge.get('node') or {}
+            pid = node.get('id')
+            if not pid or pid in seen_ids:
+                continue
+            seen_ids.add(pid)
+            product = _gql_node_to_rest(node)
+            if _is_excluded_product(product):
+                continue
+            accumulated.append(product)
+            if len(accumulated) >= max_results:
+                break
+
+        if len(accumulated) >= max_results:
             break
 
-    logger.info(f'[shopify] product search query={q!r} → '
-                f'{len(products)} raw, {len(filtered)} apos filtro')
-    return filtered
+    logger.info(f'[shopify] gql search query={query!r} final: '
+                f'{len(accumulated)} produto(s) apos {len(variants)} variantes')
+    return accumulated
 
 
 def _strip_html(html):
