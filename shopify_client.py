@@ -330,8 +330,8 @@ def _query_variants(query):
 
 
 _PRODUCT_SEARCH_GQL = """
-query SearchProducts($q: String!, $first: Int!) {
-  products(first: $first, query: $q) {
+query SearchProducts($q: String!, $first: Int!, $sortKey: ProductSortKeys, $reverse: Boolean) {
+  products(first: $first, query: $q, sortKey: $sortKey, reverse: $reverse) {
     edges {
       node {
         id
@@ -351,6 +351,30 @@ query SearchProducts($q: String!, $first: Int!) {
   }
 }
 """
+
+# Mapeamento de ordenacao amigavel -> ProductSortKeys do Shopify GraphQL
+_GQL_SORT_MAP = {
+    'best_selling': ('BEST_SELLING', False),  # mais vendidos primeiro
+    'price_asc':    ('PRICE', False),          # mais baratos primeiro
+    'price_desc':   ('PRICE', True),           # mais caros primeiro
+    'relevance':    ('RELEVANCE', False),      # algoritmo Shopify
+    'created_desc': ('CREATED_AT', True),      # mais recentes primeiro
+}
+
+
+def _gql_sort_params(sort_label):
+    """Resolve sortKey + reverse pro Shopify a partir de um label simples."""
+    return _GQL_SORT_MAP.get(sort_label, _GQL_SORT_MAP['best_selling'])
+
+
+def _slugify(s):
+    """Converte 'Aniversário Premium' -> 'aniversario-premium'. Usado pra
+    montar tags de destaque (ex: 'dest-aniversario')."""
+    if not s:
+        return ''
+    txt = _strip_accents(s).lower()
+    txt = re.sub(r'[^a-z0-9]+', '-', txt)
+    return txt.strip('-')
 
 
 def _graphql(query_str, variables=None, timeout=15):
@@ -396,15 +420,41 @@ def _gql_node_to_rest(node):
     }
 
 
-def search_products(query, max_results=5, timeout=15):
-    """Busca produtos via GraphQL search da Admin API.
+def _run_gql_search(search_q, first, sort_key, reverse, timeout):
+    """Executa uma busca GraphQL e retorna lista de nodes (ou [] em erro)."""
+    data, err = _graphql(
+        _PRODUCT_SEARCH_GQL,
+        variables={
+            'q': search_q,
+            'first': first,
+            'sortKey': sort_key,
+            'reverse': reverse,
+        },
+        timeout=timeout,
+    )
+    if err:
+        logger.warning(f'[shopify] gql search q={search_q!r} error: {err}')
+        return []
+    edges = ((data or {}).get('products') or {}).get('edges') or []
+    logger.info(f'[shopify] gql search q={search_q!r} sort={sort_key}/{reverse} '
+                f'→ {len(edges)} hit(s)')
+    return [edge.get('node') for edge in edges if edge.get('node')]
 
-    O Shopify GraphQL `products(query: ...)` faz busca full-text em title,
-    vendor, product_type e tags — muito mais robusto que o filtro `title=`
-    do REST. Tenta variantes com/sem acento pra cobrir Unicode quirks.
 
-    Retorna lista de produtos no shape REST-like (compativel com
-    summarize_product).
+def search_products(query, max_results=5, sort='best_selling', timeout=15):
+    """Busca produtos via GraphQL Admin API com priorizacao em camadas:
+
+    1. PRIORIDADE: produtos com tag `dest-<slug>` (ex: dest-aniversario) —
+       voce marca no admin Shopify os destaques curados pra cada ocasiao.
+    2. FALLBACK: busca full-text na query original (title + vendor +
+       product_type + tags do produto).
+
+    Tudo ordenado por `sort` (best_selling default).
+
+    Args:
+        query: termo da busca ("vinho", "aniversario", "mae"...)
+        max_results: max produtos retornados (default 5)
+        sort: best_selling | price_asc | price_desc | relevance | created_desc
     """
     if not is_configured() or not query:
         return []
@@ -413,28 +463,14 @@ def search_products(query, max_results=5, timeout=15):
     if not variants:
         return []
 
-    api_first = max(5, min(int(max_results) * 2, 20))
+    sort_key, reverse = _gql_sort_params(sort)
+    api_first = max(5, min(int(max_results) * 3, 25))
+
     seen_ids = set()
     accumulated = []
 
-    for v_idx, v in enumerate(variants):
-        # Search syntax do Shopify: termo livre + filtro de status
-        search_q = f'{v} status:active'
-        data, err = _graphql(
-            _PRODUCT_SEARCH_GQL,
-            variables={'q': search_q, 'first': api_first},
-            timeout=timeout,
-        )
-        if err:
-            logger.warning(f'[shopify] gql search variant={v!r} error: {err}')
-            continue
-
-        edges = ((data or {}).get('products') or {}).get('edges') or []
-        logger.info(f'[shopify] gql search query={query!r} variant#{v_idx}='
-                    f'{search_q!r} → {len(edges)} hit(s)')
-
-        for edge in edges:
-            node = edge.get('node') or {}
+    def _append_nodes(nodes):
+        for node in nodes:
             pid = node.get('id')
             if not pid or pid in seen_ids:
                 continue
@@ -444,13 +480,31 @@ def search_products(query, max_results=5, timeout=15):
                 continue
             accumulated.append(product)
             if len(accumulated) >= max_results:
-                break
+                return True
+        return False
 
+    # FASE 1: tag de destaque curada pelo operador
+    slug = _slugify(query)
+    if slug:
+        boost_tag = f'dest-{slug}'
+        boost_q = f'tag:{boost_tag} status:active'
+        nodes = _run_gql_search(boost_q, api_first, sort_key, reverse, timeout)
+        if nodes:
+            logger.info(f'[shopify] boost tag {boost_tag!r}: {len(nodes)} produto(s)')
+        if _append_nodes(nodes):
+            return accumulated
+
+    # FASE 2: busca livre full-text (title + tags + vendor + product_type)
+    for v in variants:
         if len(accumulated) >= max_results:
             break
+        search_q = f'{v} status:active'
+        nodes = _run_gql_search(search_q, api_first, sort_key, reverse, timeout)
+        if _append_nodes(nodes):
+            break
 
-    logger.info(f'[shopify] gql search query={query!r} final: '
-                f'{len(accumulated)} produto(s) apos {len(variants)} variantes')
+    logger.info(f'[shopify] search query={query!r} sort={sort!r} final: '
+                f'{len(accumulated)} produto(s)')
     return accumulated
 
 

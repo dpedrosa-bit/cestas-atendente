@@ -181,6 +181,28 @@ TOOL_DEFINITIONS = [
                     'type': 'integer',
                     'description': 'Quantos retornar (1-5). Default 5.',
                 },
+                'sort': {
+                    'type': 'string',
+                    'enum': ['best_selling', 'price_asc', 'price_desc',
+                             'relevance', 'created_desc'],
+                    'description': (
+                        'Ordenacao dos resultados. Use conforme o sinal do '
+                        'cliente:\n'
+                        '- "best_selling" (DEFAULT) — mais vendidos primeiro. '
+                        'Use quando cliente nao deu sinal claro de preco.\n'
+                        '- "price_asc" — mais baratos primeiro. Use quando '
+                        'cliente disser "algo simples", "economico", '
+                        '"basico", "nao quero gastar muito", "tem mais '
+                        'em conta?".\n'
+                        '- "price_desc" — mais caros primeiro. Use quando '
+                        'cliente disser "premium", "especial", "top de '
+                        'linha", "marcante", "presente impactante", "luxo".\n'
+                        '- "created_desc" — lancamentos primeiro. Use quando '
+                        'cliente perguntar "novidades", "novos produtos".\n'
+                        '- "relevance" — algoritmo Shopify. Raramente '
+                        'melhor que best_selling.'
+                    ),
+                },
             },
             'required': ['query'],
         },
@@ -440,12 +462,15 @@ def _tool_buscar_produtos(input_data, context):
         max_results = 5
     max_results = max(1, min(max_results, 5))
 
-    raw = shopify_client.search_products(query, max_results=max_results)
+    sort = ((input_data or {}).get('sort') or 'best_selling').strip()
+
+    raw = shopify_client.search_products(query, max_results=max_results, sort=sort)
     summarized = [shopify_client.summarize_product(p) for p in raw if p]
     summarized = [s for s in summarized if s and s.get('title')]
 
     return {
         'query': query,
+        'sort': sort,
         'count': len(summarized),
         'products': summarized,
     }
